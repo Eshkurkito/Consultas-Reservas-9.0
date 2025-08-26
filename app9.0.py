@@ -215,6 +215,10 @@ def help_block(kind: str):
 - *ADR*: ADR por noche (prorrateado) en cada celda.
 **Uso:** detectar huecos, solapes y variaciones de precio a nivel micro.
         """,
+        "Resumen": """
+**Qué es:** vista rápida del periodo con KPIs principales, ritmo de reservas y bandas de ADR.
+**Incluye:** semáforos de pace y precio, tabla DOW y un simulador para probar cambios de ADR.
+        """,
         "Estacionalidad": """
 **Qué es:** distribución por **Mes del año**, **Día de la semana** o **Día del mes**.
 **Base:** por *Noches (estancia)* o *Reservas (check-in)*. Opción de **índice** (1=media) para ver forma sin volumen.
@@ -667,6 +671,7 @@ mode = st.sidebar.radio(
         "Operativa",
         "Calidad de datos",
         "Calendario por alojamiento",
+        "Resumen & Simulador",
     ],
 )
 
@@ -1780,112 +1785,152 @@ elif mode == "Resumen & Simulador":
     with st.sidebar:
         st.header("Parámetros")
         cutoff_r = st.date_input("Fecha de corte", value=date(2024, 8, 21), key="cut_resumen")
-        # Usa el periodo global si el interruptor está activo
         start_r, end_r = period_inputs("Inicio del periodo", "Fin del periodo", date(2024, 9, 1), date(2024, 9, 30), "resumen")
         props_r = st.multiselect("Alojamientos (opcional)", options=sorted(raw["Alojamiento"].unique()), default=[], key="props_resumen")
         inv_r = st.number_input("Inventario (opcional)", min_value=0, value=0, step=1, key="inv_resumen")
-        inv_r_prev = st.number_input("Inventario LY (opcional)", min_value=0, value=0, step=1, key="inv_resumen_prev")
         ref_years_r = st.slider("Años de referencia (pace)", 1, 3, 2)
         dmax_r = st.slider("D máximo pace", 60, 365, 180, 10)
         st.markdown("—")
         st.subheader("Simulador")
-        delta_price = st.slider("Ajuste ADR del remanente (%)", -30, 30, 0, 1, help="Aplica sólo al tramo aún por vender")
-        elasticity = st.slider("Elasticidad de demanda (negativa)", -1.5, -0.2, -0.8, 0.1, help="Ej. -0.8: +10% precio ⇒ -8% noches del remanente")
+        delta_price = st.slider("Ajuste ADR del remanente (%)", -30, 30, 0, 1)
+        elasticity = st.slider("Elasticidad de demanda", -1.5, -0.2, -0.8, 0.1)
         run_r = st.button("Calcular resumen", type="primary")
 
     st.subheader("📊 Resumen & Simulador")
-    help_block("Resumen")  # (si no te aparece, añade el texto en el bloque de ayudas de abajo)
+    help_block("Resumen")
 
     if run_r:
-        # --- Filtros base
         props_sel = props_r if props_r else None
         inv_now = int(inv_r) if inv_r > 0 else None
 
-        # --- KPIs OTB actuales
-        byp, tot = compute_kpis(raw, pd.to_datetime(cutoff_r), pd.to_datetime(start_r), pd.to_datetime(end_r), inv_now, props_sel)
+        # KPIs actuales
+        _, tot = compute_kpis(raw, pd.to_datetime(cutoff_r), pd.to_datetime(start_r), pd.to_datetime(end_r), inv_now, props_sel)
         noches_otb = tot["noches_ocupadas"]
         ingresos_otb = tot["ingresos"]
         adr_otb = tot["adr"]
+        noches_disp = tot["noches_disponibles"]
 
-        # --- KPIs LY (corte y periodo -1 año)
+        # Forecast pace
+        forecast = pace_forecast_month(
+            raw, pd.to_datetime(cutoff_r), pd.to_datetime(start_r), pd.to_datetime(end_r),
+            int(ref_years_r), int(dmax_r), props_sel, inv_now
+        )
+        nights_p25 = forecast["nights_p25"]
+        nights_p50 = forecast["nights_p50"]
+        nights_p75 = forecast["nights_p75"]
+        adr_final_p50 = forecast["adr_final_p50"]
+        revenue_final_p50 = forecast["revenue_final_p50"]
+        pickup_needed = forecast["pickup_needed_p50"]
+        pickup_typ_p50 = forecast["pickup_typ_p50"]
+        pickup_typ_p75 = forecast["pickup_typ_p75"]
+        tail_adr_p50 = forecast["adr_tail_p50"]
+
+        # Pace anchors vs LY
         cutoff_ly = pd.to_datetime(cutoff_r) - pd.DateOffset(years=1)
         start_ly = pd.to_datetime(start_r) - pd.DateOffset(years=1)
         end_ly = pd.to_datetime(end_r) - pd.DateOffset(years=1)
-        inv_ly = int(inv_r_prev) if inv_r_prev > 0 else None
-        _, tot_ly = compute_kpis(raw, cutoff_ly, start_ly, end_ly, inv_ly, props_sel)
-
-        # --- Pace (curva D) -> hitos D60/D30/D14 vs LY
         base_pace = pace_series(raw, pd.to_datetime(start_r), pd.to_datetime(end_r), int(dmax_r), props_sel, inv_now)
-        ly_pace = pace_series(raw, start_ly, end_ly, int(dmax_r), props_sel, inv_ly)
+        ly_pace = pace_series(raw, start_ly, end_ly, int(dmax_r), props_sel, inv_now)
         def val_at(df, D, col):
-            if df.empty: return np.nan
-            row = df.loc[df["D"]==int(D)]
+            if df.empty:
+                return np.nan
+            row = df.loc[df["D"] == int(D)]
             return float(row[col].values[0]) if len(row) else np.nan
         anchors = [60, 30, 14]
         pace_rows = []
         for D in anchors:
             occ_now = val_at(base_pace, D, "ocupacion_pct")
-            occ_ly  = val_at(ly_pace,   D, "ocupacion_pct")
+            occ_ly = val_at(ly_pace, D, "ocupacion_pct")
             delta = (occ_now - occ_ly) if (np.isfinite(occ_now) and np.isfinite(occ_ly)) else np.nan
             pace_rows.append({"Hito": f"D-{D}", "Occ% actual": occ_now, "Occ% LY": occ_ly, "Δ pp": delta})
 
-        # --- ADR bands del periodo (por reservas que intersectan)
+        # ADR bands
         dfb = raw[raw["Fecha alta"] <= pd.to_datetime(cutoff_r)].copy()
         if props_sel:
             dfb = dfb[dfb["Alojamiento"].isin(props_sel)]
-        dfb = dfb.dropna(subset=["Fecha entrada","Fecha salida"])
+        dfb = dfb.dropna(subset=["Fecha entrada", "Fecha salida"])
         los = (dfb["Fecha salida"].dt.normalize() - dfb["Fecha entrada"].dt.normalize()).dt.days.clip(lower=1)
-        dfb["adr_reserva"] = (dfb["Precio"] / los)
-        ov_start = pd.to_datetime(start_r); ov_end = pd.to_datetime(end_r) + pd.Timedelta(days=1)
+        dfb["adr_reserva"] = dfb["Precio"] / los
+        ov_start = pd.to_datetime(start_r)
+        ov_end = pd.to_datetime(end_r) + pd.Timedelta(days=1)
         mask = ~((dfb["Fecha salida"] <= ov_start) | (dfb["Fecha entrada"] >= ov_end))
         dfb = dfb[mask]
         if dfb.empty:
-            q10=q25=q50=q75=q90=np.nan
+            q25 = q50 = q75 = np.nan
         else:
             arr = dfb["adr_reserva"].dropna().values
-            q10,q25,q50,q75,q90 = [np.percentile(arr, p) for p in (10,25,50,75,90)]
+            q25, q50, q75 = [np.percentile(arr, p) for p in (25, 50, 75)]
+        if np.isfinite(adr_otb):
+            if adr_otb < q25:
+                adr_txt = "ADR por debajo de P25 → margen para subir."
+            elif adr_otb > q75:
+                adr_txt = "ADR por encima de P75 → revisar sobreprecio."
+            else:
+                adr_txt = "ADR dentro de banda P25–P75."
+        else:
+            adr_txt = "ADR no disponible."
 
-        def pos_percentil(v, q10,q25,q50,q75,q90):
-            if not np.isfinite(v): return np.nan
-            try:
-                if v <= q10: return max(0.0, 10.0*(v/max(q10,1e-9)))
-                if v <= q25: return 10.0 + (v-q10)/max(q25-q10,1e-9)*15.0
-                if v <= q50: return 25.0 + (v-q25)/max(q50-q25,1e-9)*25.0
-                if v <= q75: return 50.0 + (v-q50)/max(q75-q50,1e-9)*25.0
-                if v <= q90: return 75.0 + (v-q75)/max(q90-q75,1e-9)*15.0
-                return 95.0
-            except Exception:
-                return np.nan
-        pos_band = pos_percentil(adr_otb, q10,q25,q50,q75,q90)
-
-        # --- DOW del periodo
+        # DOW summary
         df_cut = raw[raw["Fecha alta"] <= pd.to_datetime(cutoff_r)].copy()
         if props_sel:
             df_cut = df_cut[df_cut["Alojamiento"].isin(props_sel)]
-        df_cut = df_cut.dropna(subset=["Fecha entrada","Fecha salida"])
+        df_cut = df_cut.dropna(subset=["Fecha entrada", "Fecha salida"])
         rows_dow = []
         for _, r in df_cut.iterrows():
             e, s, p = r["Fecha entrada"], r["Fecha salida"], float(r["Precio"])
-            ov_s = max(e, pd.to_datetime(start_r)); ov_e = min(s, pd.to_datetime(end_r) + pd.Timedelta(days=1))
+            ov_s = max(e, pd.to_datetime(start_r))
+            ov_e = min(s, pd.to_datetime(end_r) + pd.Timedelta(days=1))
             n = (s - e).days
-            if ov_s >= ov_e or n<=0: continue
+            if ov_s >= ov_e or n <= 0:
+                continue
             adr_n = p / n
             for d in pd.date_range(ov_s, ov_e - pd.Timedelta(days=1), freq="D"):
                 rows_dow.append({"dow": d.weekday(), "ADR": adr_n})
         dow_tab = pd.DataFrame(rows_dow)
         top_dow_txt = "—"
         if not dow_tab.empty:
-            agg = dow_tab.groupby("dow").agg(Noches=("ADR","count"), ADR=("ADR","mean")).reset_index()
-            agg["DOW"] = agg["dow"].map({0:"Lun",1:"Mar",2:"Mié",3:"Jue",4:"Vie",5:"Sáb",6:"Dom"})
+            agg = dow_tab.groupby("dow").agg(Noches=("ADR", "count"), ADR=("ADR", "mean")).reset_index()
+            agg["DOW"] = agg["dow"].map({0: "Lun", 1: "Mar", 2: "Mié", 3: "Jue", 4: "Vie", 5: "Sáb", 6: "Dom"})
             agg = agg.sort_values("Noches", ascending=False)
             top_dow_txt = f"Top noches: {', '.join(agg.head(2)['DOW'].tolist())} · Peor: {', '.join(agg.tail(2)['DOW'].tolist())}"
 
-        # --- Inventario y noches disponibles del periodo
-        inv_used = inv_now if inv_now else raw["Alojamiento"].nunique()
-        dias = (pd.to_datetime(end_r) - pd.to_datetime(start_r)).days + 1
-        noches_disp = inv_used * max(dias, 0)
+        # Evaluación pace
+        if pickup_needed <= pickup_typ_p50:
+            pace_flag = "🟢 Pace dentro del rango típico."
+        elif pickup_needed <= pickup_typ_p75:
+            pace_flag = "🟠 Pace algo retrasado."
+        else:
+            pace_flag = "🔴 Pace muy retrasado."
 
-        # --- Semáforos / Recomendación
-        # Pace: cuantos hitos en positivo vs LY
-        pos_hitos = sum(1 for r in pace_rows if np.isfinite(r["Δ pp"]) and r["Δ pp"] >= 0)
-        if pos_hitos == 3: pace_flag = "🟢"
+        # Métricas
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Noches OTB", f"{noches_otb:.0f}")
+        c2.metric("Forecast Noches (P50)", f"{nights_p50:.0f}")
+        c3.metric("ADR OTB", f"{adr_otb:.2f}")
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Pickup necesario", f"{pickup_needed:.0f}")
+        c5.metric("ADR final (P50)", f"{adr_final_p50:.2f}")
+        c6.metric("Ingresos final (P50)", f"{revenue_final_p50:.2f}")
+
+        st.markdown(pace_flag)
+        st.markdown(adr_txt)
+        st.markdown(f"DOW: {top_dow_txt}")
+
+        st.markdown("**Pace hitos vs LY (Occ%)**")
+        st.dataframe(pd.DataFrame(pace_rows), use_container_width=True)
+
+        # Simulador ADR
+        noches_rem = max(nights_p50 - noches_otb, 0.0)
+        adj_factor = (1 + delta_price / 100) ** elasticity
+        sim_nights = noches_otb + noches_rem * adj_factor
+        sim_tail_adr = tail_adr_p50 * (1 + delta_price / 100)
+        sim_revenue = ingresos_otb + sim_tail_adr * (noches_rem * adj_factor)
+        sim_adr = sim_revenue / sim_nights if sim_nights > 0 else 0.0
+        sim_occ = sim_nights / noches_disp * 100 if noches_disp > 0 else 0.0
+
+        st.markdown("**Simulación con ajuste de ADR del remanente**")
+        s1, s2, s3 = st.columns(3)
+        s1.metric("ADR final sim.", f"{sim_adr:.2f}")
+        s2.metric("Noches finales", f"{sim_nights:.0f}")
+        s3.metric("Ocupación final %", f"{sim_occ:.2f}%")
+        st.metric("Ingresos finales", f"{sim_revenue:.2f}")
